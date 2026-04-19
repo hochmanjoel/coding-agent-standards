@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+# agent-docs — manage AGENTS.md and companion markdown templates across projects.
+#
+# Usage:
+#   agent-docs init                add docs to the current project (first-time)
+#   agent-docs status              show local vs upstream versions (current project)
+#   agent-docs check               dry-run: show what sync would do
+#   agent-docs sync                apply upgrades (prompts for durable files)
+#   agent-docs sync --force        apply without prompting
+#   agent-docs status-all          show status across every registered project
+#   agent-docs sync-all            sync every registered project (prompts per project)
+#   agent-docs update              git pull the source repo (done automatically otherwise)
+#   agent-docs projects            list registered projects
+#   agent-docs forget              unregister the current project
+#
+# Environment:
+#   AGENT_DOCS_SOURCE   Path to the coding-agent-standards repo.
+#                       Default: ~/.local/share/coding-agent-standards
+#
+# Config:
+#   ~/.config/coding-agent-standards/projects   List of registered project paths, one per line.
+
+set -euo pipefail
+
+# ---------- config ----------
+
+DEFAULT_SOURCE="$HOME/.local/share/coding-agent-standards"
+SOURCE_DIR="${AGENT_DOCS_SOURCE:-$DEFAULT_SOURCE}"
+TEMPLATES_DIR="$SOURCE_DIR/templates"
+CONFIG_DIR="$HOME/.config/coding-agent-standards"
+PROJECTS_FILE="$CONFIG_DIR/projects"
+PROJECT_DIR="$(pwd)"
+
+# ---------- helpers ----------
+
+color_red()    { printf '\033[31m%s\033[0m' "$1"; }
+color_green()  { printf '\033[32m%s\033[0m' "$1"; }
+color_yellow() { printf '\033[33m%s\033[0m' "$1"; }
+color_blue()   { printf '\033[34m%s\033[0m' "$1"; }
+color_dim()    { printf '\033[2m%s\033[0m' "$1"; }
+color_bold()   { printf '\033[1m%s\033[0m' "$1"; }
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Read the JSON header of a template file. Looks for the first agent-docs:begin marker.
+# Prints the inline JSON object on stdout. Returns non-zero if not found.
+read_header() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  grep -m1 'agent-docs:begin' "$file" | sed -E 's/^.*agent-docs:begin[[:space:]]*//; s/[[:space:]]*-->.*$//'
+}
+
+# Extract a field from the header JSON using a minimal parser (no jq dependency).
+# Usage: header_field <file> <field>
+header_field() {
+  local file="$1" field="$2" hdr
+  hdr="$(read_header "$file")" || return 1
+  echo "$hdr" | sed -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/; t; s/.*//"
+}
+
+# Has the local file been modified below the header marker?
+local_is_modified() {
+  local local_file="$1" template_file="$2"
+  [[ -f "$local_file" ]] || return 1
+  local local_body template_body
+  local_body="$(strip_header "$local_file")"
+  template_body="$(strip_header "$template_file")"
+  [[ "$local_body" != "$template_body" ]]
+}
+
+strip_header() {
+  local file="$1"
+  awk '
+    /agent-docs:begin/ { skip = 1; next }
+    skip && /agent-docs:end/ { skip = 0; next }
+    skip { next }
+    { print }
+  ' "$file"
+}
+
+# ---------- source repo freshness ----------
+
+# Checks whether the source repo has upstream changes we don't have locally.
+# Returns 0 if up to date, 1 if behind, 2 if not a git repo / offline / no remote.
+# Prints a summary to stderr.
+source_freshness_check() {
+  [[ -d "$SOURCE_DIR/.git" ]] || return 2
+
+  # Fetch quietly; timeout after 5s so offline use isn't painful.
+  if ! timeout 5 git -C "$SOURCE_DIR" fetch --quiet 2>/dev/null; then
+    echo "$(color_dim "(couldn't fetch source repo updates — continuing with local copy)")" >&2
+    return 2
+  fi
+
+  local local_ref upstream_ref
+  local_ref="$(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || echo "")"
+  upstream_ref="$(git -C "$SOURCE_DIR" rev-parse '@{upstream}' 2>/dev/null || echo "")"
+
+  if [[ -z "$upstream_ref" ]]; then
+    return 2  # no upstream configured
+  fi
+
+  if [[ "$local_ref" == "$upstream_ref" ]]; then
+    return 0
+  fi
+
+  # Check if we're strictly behind (upstream is ahead of us).
+  if git -C "$SOURCE_DIR" merge-base --is-ancestor HEAD '@{upstream}' 2>/dev/null; then
+    return 1
+  fi
+  # Diverged or ahead — both unusual; treat as "can't cleanly update".
+  return 2
+}
+
+# Ensure the source repo is current. Prompts to pull if behind, unless --no-pull is set.
+ensure_source_current() {
+  if [[ "${SKIP_FETCH:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  # Capture rc in a way that doesn't trip set -e.
+  local rc=0
+  source_freshness_check || rc=$?
+
+  case $rc in
+    0) return 0 ;;
+    1)
+      echo "$(color_yellow '!') source repo is behind upstream: $SOURCE_DIR" >&2
+      if [[ "${FORCE:-0}" == "1" || "${AUTO_PULL:-0}" == "1" ]]; then
+        echo "    pulling..." >&2
+        git -C "$SOURCE_DIR" pull --quiet --ff-only
+        echo "    done" >&2
+      else
+        read -r -p "    pull latest now? [Y/n] " ans
+        if [[ "$ans" == "n" || "$ans" == "N" ]]; then
+          echo "$(color_dim "    continuing with stale source (this may show wrong versions)")" >&2
+        else
+          git -C "$SOURCE_DIR" pull --quiet --ff-only
+          echo "    done" >&2
+        fi
+      fi
+      ;;
+    2) : ;;  # offline or not a git repo — proceed silently
+  esac
+}
+
+# ---------- CHANGES.md lookup ----------
+
+# Print the CHANGES.md section for a specific template file between two versions.
+# Usage: print_changes <file-name> <from-version> <to-version>
+print_changes() {
+  local name="$1" from="$2" to="$3"
+  local changes="$SOURCE_DIR/CHANGES.md"
+  [[ -f "$changes" ]] || return 0
+
+  # CHANGES.md format:
+  # ## 0.2.0 — YYYY-MM-DD
+  # ### AGENTS.md
+  # - something changed
+  # - something else
+  # ### DECISIONS.md
+  # - thing
+  #
+  # We extract sections for <name> across versions > from, up to and including <to>.
+  awk -v name="$name" -v from="$from" -v to="$to" '
+    function vercmp(a, b,   pa, pb, i) {
+      split(a, pa, ".")
+      split(b, pb, ".")
+      for (i = 1; i <= 3; i++) {
+        if ((pa[i]+0) < (pb[i]+0)) return -1
+        if ((pa[i]+0) > (pb[i]+0)) return  1
+      }
+      return 0
+    }
+    /^## / {
+      # parse version from "## X.Y.Z — date" or "## X.Y.Z"
+      v = $2
+      in_range = (vercmp(v, from) > 0 && vercmp(v, to) <= 0)
+      printing = 0
+      next
+    }
+    /^### / && in_range {
+      file = substr($0, 5)
+      sub(/[[:space:]]+$/, "", file)
+      printing = (file == name)
+      next
+    }
+    /^### / { printing = 0; next }
+    printing && in_range { print "      " $0 }
+  ' "$changes"
+}
+
+# ---------- per-project state ----------
+
+# Register this project in the projects list (idempotent).
+register_project() {
+  mkdir -p "$CONFIG_DIR"
+  touch "$PROJECTS_FILE"
+  if ! grep -qxF "$PROJECT_DIR" "$PROJECTS_FILE"; then
+    echo "$PROJECT_DIR" >> "$PROJECTS_FILE"
+  fi
+}
+
+unregister_project() {
+  [[ -f "$PROJECTS_FILE" ]] || { echo "no projects registered"; return 0; }
+  local tmp; tmp="$(mktemp)"
+  grep -vxF "$PROJECT_DIR" "$PROJECTS_FILE" > "$tmp" || true
+  mv "$tmp" "$PROJECTS_FILE"
+  echo "unregistered: $PROJECT_DIR"
+}
+
+list_projects() {
+  [[ -f "$PROJECTS_FILE" ]] || { echo "(no projects registered)"; return 0; }
+  cat "$PROJECTS_FILE"
+}
+
+# ---------- claude.md symlink ----------
+
+ensure_claude_symlink() {
+  local agents="$PROJECT_DIR/AGENTS.md"
+  local claude="$PROJECT_DIR/CLAUDE.md"
+
+  [[ -f "$agents" ]] || return 0
+
+  if [[ -L "$claude" ]]; then
+    # already a symlink — verify it points to AGENTS.md
+    local target; target="$(readlink "$claude")"
+    if [[ "$target" == "AGENTS.md" ]]; then
+      return 0
+    fi
+    echo "  $(color_yellow '!') CLAUDE.md is a symlink to '$target' (expected AGENTS.md); leaving alone"
+    return 0
+  fi
+
+  if [[ -f "$claude" ]]; then
+    echo "  $(color_yellow '!') CLAUDE.md exists as a regular file; not converting to symlink. Review it manually."
+    return 0
+  fi
+
+  if ln -s AGENTS.md "$claude" 2>/dev/null; then
+    echo "  $(color_green '+') CLAUDE.md  $(color_dim "(symlink → AGENTS.md)")"
+  else
+    # symlink failed (probably Windows without dev mode). Fall back to a copy.
+    cp "$agents" "$claude"
+    echo "  $(color_green '+') CLAUDE.md  $(color_dim "(copy of AGENTS.md — symlinks unavailable)")"
+  fi
+}
+
+# ---------- status & sync ----------
+
+cmd_status() {
+  ensure_source_current
+  [[ -d "$TEMPLATES_DIR" ]] || die "templates/ not found at $TEMPLATES_DIR (is AGENT_DOCS_SOURCE correct?)"
+
+  echo "$(color_bold "Agent docs status")"
+  echo "  Source:  $SOURCE_DIR"
+  echo "  Project: $PROJECT_DIR"
+  echo
+
+  printf '  %-18s %-10s %-10s %-12s %s\n' "FILE" "LOCAL" "UPSTREAM" "KIND" "STATE"
+
+  for template in "$TEMPLATES_DIR"/*.md; do
+    local name; name="$(basename "$template")"
+    local local_file="$PROJECT_DIR/$name"
+    local upstream_ver; upstream_ver="$(header_field "$template" version)"
+    local kind; kind="$(header_field "$template" kind)"
+    local local_ver state
+
+    if [[ -f "$local_file" ]]; then
+      local_ver="$(header_field "$local_file" version 2>/dev/null || echo "-")"
+      if [[ -z "$local_ver" ]]; then
+        local_ver="-"
+        state="$(color_yellow "unmanaged")"
+      elif [[ "$local_ver" == "$upstream_ver" ]]; then
+        if local_is_modified "$local_file" "$template"; then
+          state="$(color_blue "edited-locally")"
+        else
+          state="$(color_green "current")"
+        fi
+      else
+        state="$(color_yellow "upgrade-available")"
+      fi
+    else
+      local_ver="-"
+      state="$(color_dim "missing")"
+    fi
+    printf '  %-18s %-10s %-10s %-12s %b\n' "$name" "$local_ver" "$upstream_ver" "$kind" "$state"
+  done
+}
+
+# Perform sync for a single file.
+sync_file() {
+  local template="$1"
+  local name; name="$(basename "$template")"
+  local local_file="$PROJECT_DIR/$name"
+  local upstream_ver; upstream_ver="$(header_field "$template" version)"
+  local kind; kind="$(header_field "$template" kind)"
+
+  if [[ ! -f "$local_file" ]]; then
+    echo "  $(color_green '+') $name  $(color_dim "(creating, v$upstream_ver)")"
+    if [[ "${DRY_RUN:-0}" != "1" ]]; then
+      cp "$template" "$local_file"
+    fi
+    return 0
+  fi
+
+  local local_ver; local_ver="$(header_field "$local_file" version 2>/dev/null || echo "")"
+
+  if [[ -z "$local_ver" ]]; then
+    echo "  $(color_yellow '?') $name  $(color_dim "(unmanaged file present; leaving alone)")"
+    echo "     Run 'agent-docs adopt $name' to see how to convert it (not yet implemented — for now, back it up and re-init)"
+    return 0
+  fi
+
+  if [[ "$local_ver" == "$upstream_ver" ]]; then
+    return 0
+  fi
+
+  # Show what changed in CHANGES.md between versions (if any).
+  local changes_snippet
+  changes_snippet="$(print_changes "$name" "$local_ver" "$upstream_ver")"
+
+  case "$kind" in
+    durable)
+      echo "  $(color_blue '↑') $name  $local_ver → $upstream_ver  $(color_dim "(durable; will overwrite)")"
+      [[ -n "$changes_snippet" ]] && echo "$changes_snippet"
+      if [[ "${FORCE:-0}" != "1" && "${DRY_RUN:-0}" != "1" ]]; then
+        diff -u "$local_file" "$template" || true
+        read -r -p "    overwrite $name? [y/N] " ans
+        if [[ "$ans" != "y" && "$ans" != "Y" ]]; then
+          echo "    skipped"
+          return 1
+        fi
+      fi
+      if [[ "${DRY_RUN:-0}" != "1" ]]; then
+        cp "$template" "$local_file"
+      fi
+      ;;
+    per-project|seed-once)
+      local label; [[ "$kind" == "per-project" ]] && label="per-project" || label="seed-once"
+      echo "  $(color_dim "·") $name  $local_ver → $upstream_ver  $(color_dim "($label; header updated, body preserved)")"
+      [[ -n "$changes_snippet" ]] && echo "$changes_snippet"
+      if [[ "${DRY_RUN:-0}" != "1" ]]; then
+        update_header_version "$local_file" "$upstream_ver"
+      fi
+      ;;
+    *)
+      echo "  $(color_red 'x') $name  $(color_red "unknown kind '$kind' in template; skipping")"
+      return 1
+      ;;
+  esac
+}
+
+update_header_version() {
+  local file="$1" new_ver="$2"
+  local tmp; tmp="$(mktemp)"
+  awk -v ver="$new_ver" '
+    /agent-docs:begin/ && !done {
+      sub(/"version"[[:space:]]*:[[:space:]]*"[^"]*"/, "\"version\": \"" ver "\"")
+      done = 1
+    }
+    { print }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+cmd_sync() {
+  ensure_source_current
+  [[ -d "$TEMPLATES_DIR" ]] || die "templates/ not found at $TEMPLATES_DIR"
+
+  echo "Syncing agent docs in $PROJECT_DIR"
+
+  for template in "$TEMPLATES_DIR"/*.md; do
+    sync_file "$template" || true
+  done
+
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    echo
+    echo "$(color_dim "(dry run — no files were changed)")"
+  fi
+}
+
+cmd_init() {
+  ensure_source_current
+  [[ -d "$TEMPLATES_DIR" ]] || die "templates/ not found at $TEMPLATES_DIR"
+
+  echo "$(color_bold "Initializing agent docs in $PROJECT_DIR")"
+  echo
+
+  for template in "$TEMPLATES_DIR"/*.md; do
+    sync_file "$template" || true
+  done
+
+  ensure_claude_symlink
+  register_project
+
+  echo
+  echo "$(color_green 'Done.') Next steps:"
+  echo "  1. Fill in $(color_bold DEVELOPMENT.md) with this project's install / run / test commands."
+  echo "  2. Commit the new files."
+  echo
+  echo "$(color_dim "This project is now registered. Run 'agent-docs status-all' to see it alongside others.")"
+}
+
+# ---------- multi-project commands ----------
+
+cmd_status_all() {
+  ensure_source_current
+  [[ -f "$PROJECTS_FILE" ]] || { echo "(no projects registered — run 'agent-docs init' in a project first)"; return 0; }
+
+  local any=0
+  while IFS= read -r proj; do
+    [[ -z "$proj" ]] && continue
+    if [[ ! -d "$proj" ]]; then
+      echo "$(color_red 'MISSING') $proj  $(color_dim "(directory no longer exists)")"
+      continue
+    fi
+    any=1
+    (
+      PROJECT_DIR="$proj"
+      SKIP_FETCH=1 cmd_status_compact
+    )
+  done < "$PROJECTS_FILE"
+
+  [[ "$any" == "0" ]] && echo "(projects file exists but has no valid entries)"
+}
+
+# Compact one-line status per project for status-all.
+cmd_status_compact() {
+  local needs_upgrade=0 missing=0 total=0
+  for template in "$TEMPLATES_DIR"/*.md; do
+    total=$((total+1))
+    local name; name="$(basename "$template")"
+    local local_file="$PROJECT_DIR/$name"
+    local upstream_ver; upstream_ver="$(header_field "$template" version)"
+
+    if [[ ! -f "$local_file" ]]; then
+      missing=$((missing+1))
+      continue
+    fi
+    local local_ver; local_ver="$(header_field "$local_file" version 2>/dev/null || echo "")"
+    if [[ -n "$local_ver" && "$local_ver" != "$upstream_ver" ]]; then
+      needs_upgrade=$((needs_upgrade+1))
+    fi
+  done
+
+  local summary
+  if (( needs_upgrade == 0 && missing == 0 )); then
+    summary="$(color_green 'current')"
+  elif (( needs_upgrade > 0 && missing == 0 )); then
+    summary="$(color_yellow "$needs_upgrade upgrade(s) available")"
+  elif (( missing > 0 && needs_upgrade == 0 )); then
+    summary="$(color_dim "$missing file(s) missing")"
+  else
+    summary="$(color_yellow "$needs_upgrade upgrade(s), $missing missing")"
+  fi
+  printf '  %-50s %b\n' "$PROJECT_DIR" "$summary"
+}
+
+cmd_sync_all() {
+  ensure_source_current
+  [[ -f "$PROJECTS_FILE" ]] || { echo "(no projects registered)"; return 0; }
+
+  while IFS= read -r proj; do
+    [[ -z "$proj" ]] && continue
+    if [[ ! -d "$proj" ]]; then
+      echo "$(color_red 'skip') $proj  $(color_dim "(directory no longer exists — consider removing from $PROJECTS_FILE)")"
+      continue
+    fi
+    echo
+    echo "$(color_bold "=== $proj ===")"
+    (
+      PROJECT_DIR="$proj"
+      SKIP_FETCH=1 cmd_sync
+    )
+  done < "$PROJECTS_FILE"
+}
+
+# ---------- misc commands ----------
+
+cmd_update() {
+  [[ -d "$SOURCE_DIR/.git" ]] || die "source dir is not a git repo: $SOURCE_DIR"
+  echo "Pulling latest from $SOURCE_DIR"
+  git -C "$SOURCE_DIR" pull --ff-only
+}
+
+cmd_projects() { list_projects; }
+cmd_forget()   { unregister_project; }
+
+# ---------- entry point ----------
+
+DRY_RUN=0
+FORCE=0
+
+usage() {
+  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+subcmd="${1:-}"
+shift || true
+
+for arg in "$@"; do
+  case "$arg" in
+    --force|-f)   FORCE=1 ;;
+    --dry-run|-n) DRY_RUN=1 ;;
+    --no-fetch)   SKIP_FETCH=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            die "unknown argument: $arg" ;;
+  esac
+done
+
+case "$subcmd" in
+  init)        cmd_init ;;
+  status)      cmd_status ;;
+  check)       DRY_RUN=1; cmd_sync ;;
+  sync)        cmd_sync ;;
+  status-all)  cmd_status_all ;;
+  sync-all)    cmd_sync_all ;;
+  update)      cmd_update ;;
+  projects)    cmd_projects ;;
+  forget)      cmd_forget ;;
+  ""|help|-h|--help) usage ;;
+  *) die "unknown command: $subcmd (try: init, status, check, sync, status-all, sync-all, update, projects, forget)" ;;
+esac
