@@ -1,4 +1,4 @@
-<!-- agent-docs:begin { "file": "DEVELOPMENT.md", "version": "0.1.0", "kind": "per-project" } -->
+<!-- agent-docs:begin { "file": "DEVELOPMENT.md", "version": "1.0.0", "kind": "per-project" } -->
 <!-- Seeded by agent-docs-sync. Fill in for this specific project; the sync tool will never overwrite this file once populated. -->
 <!-- agent-docs:end -->
 

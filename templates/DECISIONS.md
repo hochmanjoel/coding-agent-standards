@@ -1,4 +1,4 @@
-<!-- agent-docs:begin { "file": "DECISIONS.md", "version": "0.1.0", "kind": "seed-once" } -->
+<!-- agent-docs:begin { "file": "DECISIONS.md", "version": "1.0.0", "kind": "seed-once" } -->
 <!-- Seeded by agent-docs-sync. This file is never overwritten once it exists. -->
 <!-- agent-docs:end -->
 
