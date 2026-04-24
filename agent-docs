@@ -55,7 +55,7 @@ read_header() {
 header_field() {
   local file="$1" field="$2" hdr
   hdr="$(read_header "$file")" || return 1
-  echo "$hdr" | sed -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/; t; s/.*//"
+  echo "$hdr" | sed -nE "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p"
 }
 
 # Has the local file been modified below the header marker?
