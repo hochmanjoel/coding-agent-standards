@@ -36,6 +36,44 @@ Exploration log. Things tried, whether they worked, and what we learned. This is
 
 <!-- New entries go here, newest first -->
 
+## 2026-04-24 — Why pull the whole repo instead of just templates?
+
+**Question:** Projects only consume the template files. Why does `agent-docs update` (and the auto-pull inside `sync`) fetch the entire repo rather than just `templates/`?
+
+**What I tried:** Considered what a templates-only distribution would require.
+
+**Conclusion:** The git-clone-as-install model is the simplest thing that works. The clone at `~/.local/share/coding-agent-standards` contains three things that all need to stay in lockstep:
+
+- The CLI script (`agent-docs` — the binary is a symlink into this clone)
+- The templates under `templates/`
+- `CHANGES.md`, which `sync` reads to show diffs between template versions
+
+A templates-only fetch would require a separate artifact (release tarball, CDN, something), plus separate update logic for the CLI, plus a way to keep `CHANGES.md` available. Three moving parts for roughly ~100KB saved — not worth it.
+
+Only the project itself matters for project-side bloat, and each project only receives the *copied-in* template files, not the clone. The clone lives entirely in `~/.local/share/` and is shared across all registered projects.
+
+Revisit if: the repo ever grows large (e.g. adds binary assets, big `research/` attachments that aren't needed at runtime), or if `agent-docs` is ever distributed through a package manager that expects versioned release artifacts.
+
+**Related:** [`install.sh`](install.sh), [`agent-docs`](agent-docs) `SOURCE_DIR`/`TEMPLATES_DIR`.
+
+## 2026-04-24 — Should the CLI auto-update on every run?
+
+**Question:** `sync` already auto-pulls the source clone, which also updates the CLI binary (since the script lives in the clone). Why don't mainstream tools (npm, kubectl, terraform, etc.) do the same?
+
+**What I tried:** Reasoned through the tradeoffs before committing to the current behavior.
+
+**Conclusion:** Auto-update is fine here because the blast radius is tiny (personal tool, single author, no CI depends on a pinned version). It's not fine for mainstream tools because:
+
+- **Reproducibility.** If the tool silently changes version mid-workflow, builds break in ways that are hard to debug ("it worked yesterday"). Teams pin tool versions deliberately.
+- **Security.** Auto-pull-and-execute means any source compromise (stolen creds, bad PR merged) runs everywhere instantly, with no human checkpoint.
+- **Breaking changes.** Major releases ship incompatibilities. A manual update is a chance to read the changelog; an auto-update isn't.
+- **Network / latency / offline.** Every invocation would need a network round-trip, and would fail or stall offline.
+- **Shared environments.** CI, servers, and laptops want different cadences. One global auto-update policy fits none of them.
+
+Decision for `agent-docs`: keep auto-pull as the default, with `--no-pull` as the escape hatch. Keep `update` as an explicit "refresh only, don't do anything else" command. If this tool ever grows beyond personal use, revisit — especially points 1 and 2.
+
+**Related:** [`agent-docs`](agent-docs) `ensure_source_current`; commit d647ee4.
+
 ## 2026-04-21 — Foundational principles to put in AGENTS.md 1.0.0
 
 **Question:** What belongs in a stack-agnostic `AGENTS.md` that's genuinely durable across projects and aimed specifically at AI coding agents? The 0.1.0 release was a first-pass working agreement; what does the literature and current-practice guidance actually say should be in it?
