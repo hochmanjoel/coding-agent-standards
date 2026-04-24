@@ -7,6 +7,7 @@
 #   agent-docs check               dry-run: show what sync would do
 #   agent-docs sync                apply upgrades (prompts for durable files)
 #   agent-docs sync --force        apply without prompting
+#   agent-docs sync --no-pull      skip the auto-pull of the source repo
 #   agent-docs status-all          show status across every registered project
 #   agent-docs sync-all            sync every registered project (prompts per project)
 #   agent-docs update              git pull the source repo (done automatically otherwise)
@@ -112,9 +113,9 @@ source_freshness_check() {
   return 2
 }
 
-# Ensure the source repo is current. Prompts to pull if behind, unless --no-pull is set.
+# Ensure the source repo is current. Auto-pulls if behind, unless --no-pull is set.
 ensure_source_current() {
-  if [[ "${SKIP_FETCH:-0}" == "1" ]]; then
+  if [[ "${SKIP_PULL:-0}" == "1" ]]; then
     return 0
   fi
 
@@ -125,20 +126,8 @@ ensure_source_current() {
   case $rc in
     0) return 0 ;;
     1)
-      echo "$(color_yellow '!') source repo is behind upstream: $SOURCE_DIR" >&2
-      if [[ "${FORCE:-0}" == "1" || "${AUTO_PULL:-0}" == "1" ]]; then
-        echo "    pulling..." >&2
-        git -C "$SOURCE_DIR" pull --quiet --ff-only
-        echo "    done" >&2
-      else
-        read -r -p "    pull latest now? [Y/n] " ans
-        if [[ "$ans" == "n" || "$ans" == "N" ]]; then
-          echo "$(color_dim "    continuing with stale source (this may show wrong versions)")" >&2
-        else
-          git -C "$SOURCE_DIR" pull --quiet --ff-only
-          echo "    done" >&2
-        fi
-      fi
+      echo "$(color_dim "source repo behind upstream — pulling...")" >&2
+      git -C "$SOURCE_DIR" pull --quiet --ff-only
       ;;
     2) : ;;  # offline or not a git repo — proceed silently
   esac
@@ -418,7 +407,7 @@ cmd_status_all() {
     any=1
     (
       PROJECT_DIR="$proj"
-      SKIP_FETCH=1 cmd_status_compact
+      SKIP_PULL=1 cmd_status_compact
     )
   done < "$PROJECTS_FILE"
 
@@ -471,7 +460,7 @@ cmd_sync_all() {
     echo "$(color_bold "=== $proj ===")"
     (
       PROJECT_DIR="$proj"
-      SKIP_FETCH=1 cmd_sync
+      SKIP_PULL=1 cmd_sync
     )
   done < "$PROJECTS_FILE"
 }
@@ -503,7 +492,7 @@ for arg in "$@"; do
   case "$arg" in
     --force|-f)   FORCE=1 ;;
     --dry-run|-n) DRY_RUN=1 ;;
-    --no-fetch)   SKIP_FETCH=1 ;;
+    --no-pull)    SKIP_PULL=1 ;;
     -h|--help)    usage; exit 0 ;;
     *)            die "unknown argument: $arg" ;;
   esac
